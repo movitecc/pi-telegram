@@ -13,6 +13,8 @@ interface TelegramConfig {
 	botId?: number;
 	allowedUserId?: number;
 	lastUpdateId?: number;
+	reconnectAfterSessionSwitch?: boolean;
+	currentSessionFile?: string;
 }
 
 interface TelegramApiResponse<T> {
@@ -293,6 +295,7 @@ export default function (pi: ExtensionAPI) {
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
+	let telegramSessionSwitchPending = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
@@ -755,6 +758,38 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/new") {
+			if (telegramSessionSwitchPending || !ctx.isIdle() || activeTelegramTurn || queuedTelegramTurns.length > 0) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy, switching sessions, or Telegram messages are queued.");
+				return;
+			}
+			telegramSessionSwitchPending = true;
+			const parentSession = ctx.sessionManager.getSessionFile();
+			setImmediate(() => {
+				void (async () => {
+					try {
+						config.reconnectAfterSessionSwitch = true;
+						await writeConfig(config);
+						const result = await ctx.newSession({ parentSession });
+					if (result.cancelled) {
+						config.reconnectAfterSessionSwitch = false;
+						await writeConfig(config);
+						await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "New session cancelled; current session preserved.");
+						telegramSessionSwitchPending = false;
+						return;
+					}
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Started a fresh session; previous session preserved.");
+				} catch (error) {
+					telegramSessionSwitchPending = false;
+					config.reconnectAfterSessionSwitch = false;
+					await writeConfig(config).catch(() => undefined);
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Could not start a new session: ${error instanceof Error ? error.message : String(error)}`).catch(() => undefined);
+				}
+				})();
+			});
+			return;
+		}
+
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
@@ -824,7 +859,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /compact, /new, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -933,8 +968,23 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	async function registerTelegramCommands(): Promise<void> {
+		await callTelegram("setMyCommands", {
+			commands: [
+				{ command: "new", description: "Start a fresh session" },
+				{ command: "status", description: "Show model and usage status" },
+				{ command: "compact", description: "Compact the current session" },
+				{ command: "help", description: "Show help and available commands" },
+				{ command: "stop", description: "Stop the current response" },
+			],
+			scope: { type: "all_private_chats" },
+		});
+		await callTelegram("setChatMenuButton", { menu_button: { type: "commands" } });
+	}
+
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
+		await registerTelegramCommands();
 		pollingController = new AbortController();
 		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
 			pollingPromise = undefined;
@@ -1023,6 +1073,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (sessionFile) config.currentSessionFile = sessionFile;
+		else delete config.currentSessionFile;
+		const reconnectAfterSessionSwitch = config.reconnectAfterSessionSwitch === true;
+		config.reconnectAfterSessionSwitch = false;
+		await writeConfig(config);
+		if (reconnectAfterSessionSwitch) await startPolling(ctx);
 		updateStatus(ctx);
 	});
 
@@ -1124,7 +1181,7 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }

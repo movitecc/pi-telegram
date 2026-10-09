@@ -1,0 +1,70 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+async function waitFor(predicate, timeoutMs=3000) {
+ const end=Date.now()+timeoutMs;
+ while(Date.now()<end){ if(predicate()) return; await new Promise(r=>setTimeout(r,10)); }
+ throw new Error('condition timed out');
+}
+
+async function setup() {
+ const home=await mkdtemp(join(tmpdir(),'pi-telegram-')); process.env.HOME=home;
+ const dir=join(home,'.pi','agent'); await mkdir(dir,{recursive:true});
+ await writeFile(join(dir,'telegram.json'),JSON.stringify({botToken:'test',allowedUserId:7,lastUpdateId:0}));
+ const calls=[]; let updates=[];
+ globalThis.fetch=async (url, init={})=>{ const method=String(url).split('/').pop(); let body={}; try{body=JSON.parse(init.body)}catch{}
+ calls.push({method,body});
+ if(method==='getUpdates'){ const batch=updates; updates=[]; await new Promise(resolve=>{const timer=setTimeout(resolve,3); init.signal?.addEventListener('abort',()=>{clearTimeout(timer);resolve()},{once:true});}); if(init.signal?.aborted) throw new DOMException('aborted','AbortError'); return Response.json({ok:true,result:batch}); }
+ return Response.json({ok:true,result: method==='sendMessage'?{message_id:99}:true}); };
+ const {default:extension}=await import('./index.ts?test='+Math.random());
+ const handlers={}, commands={}, sent=[];
+ const pi={on:(n,fn)=>handlers[n]=fn, registerCommand:(n,c)=>commands[n]=c, registerTool(){}, sendUserMessage:(content,opts)=>sent.push({content,opts})};
+ let idle=true, currentSessionFile='/parent.json'; const ctx={isIdle:()=>idle, sessionManager:{getEntries:()=>[],getSessionFile:()=>currentSessionFile}, ui:{theme:{fg:(_c,s)=>s},setStatus(){}}, newSession:async()=>({cancelled:false})};
+ extension(pi); await handlers.session_start({},ctx); await new Promise(r=>setTimeout(r,20));
+ return {home,calls,handlers,commands,ctx,sent,connect:()=>commands['telegram-connect'].handler('',ctx),setIdle(v){idle=v},setSessionFile(v){currentSessionFile=v},setUpdates(v){updates=v},cleanup:()=>rm(home,{recursive:true,force:true})};
+}
+const message=(id,text)=>({message_id:id,chat:{id:7,type:'private'},from:{id:7,is_bot:false,first_name:'A'},text});
+
+test('Telegram /new preserves parent and reconnects poller after shutdown/reload/start',async()=>{
+ const h=await setup(); try { await h.connect();
+  let switched=0; h.ctx.newSession=async opts=>{switched++; assert.deepEqual(opts,{parentSession:'/parent.json'}); await h.handlers.session_shutdown({},h.ctx);
+   const {default:extension}=await import('./index.ts?reload='+Math.random()); extension({on:(n,fn)=>h.handlers[n]=fn,registerCommand:(n,c)=>h.commands[n]=c,registerTool(){},sendUserMessage(){}});
+   h.setSessionFile('/new-session.json'); await h.handlers.session_start({},h.ctx); return {cancelled:false};};
+  h.setUpdates([{update_id:1,message:message(1,'/new')}]); await waitFor(()=>switched===1 && h.calls.filter(x=>x.method==='deleteWebhook').length>=2);
+  assert.equal(switched,1); assert.ok(h.calls.filter(x=>x.method==='deleteWebhook').length>=2);
+  const config=JSON.parse(await readFile(join(h.home,'.pi','agent','telegram.json'),'utf8'));
+  assert.equal(config.currentSessionFile,'/new-session.json');
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('connecting registers Telegram command menu entries',async()=>{
+ const h=await setup(); try {
+  await h.connect();
+  const registration=h.calls.find(x=>x.method==='setMyCommands');
+  assert.ok(registration,'setMyCommands must be called when the bridge connects');
+  assert.deepEqual(registration.body.commands.map(command=>command.command),['new','status','compact','help','stop']);
+  assert.equal(registration.body.scope.type,'all_private_chats');
+  const menuButton=h.calls.find(x=>x.method==='setChatMenuButton');
+  assert.ok(menuButton,'the private-chat menu button must expose bot commands');
+  assert.deepEqual(menuButton.body.menu_button,{type:'commands'});
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('two queued Telegram messages hand off using followUp exactly once',async()=>{
+ const h=await setup(); try { await h.connect();
+  h.setIdle(false);
+  h.setUpdates([{update_id:1,message:message(1,'first')},{update_id:2,message:message(2,'second')}]);
+  await new Promise(r=>setTimeout(r,80));
+  await h.handlers.agent_start({},h.ctx);
+  await h.handlers.agent_end({messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:'done'}]}]},h.ctx);
+  assert.equal(h.sent.length,1); assert.equal(h.sent[0].opts?.deliverAs,'followUp');
+  assert.match(JSON.stringify(h.sent[0].content),/second/); assert.doesNotMatch(JSON.stringify(h.sent[0].content),/first/);
+  await h.handlers.agent_start({},h.ctx);
+  await h.handlers.agent_end({messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:'second reply'}]}]},h.ctx);
+  const replies=h.calls.filter(x=>x.method==='sendMessage').map(x=>x.body.text);
+  assert.ok(replies.includes('done')); assert.ok(replies.includes('second reply'));
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
