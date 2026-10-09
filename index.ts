@@ -742,9 +742,11 @@ export default function (pi: ExtensionAPI) {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		const lower = rawText.toLowerCase();
+		const [rawCommand = "", ...commandArgs] = rawText.trim().split(/\s+/);
+		const command = rawCommand.toLowerCase();
+		const argument = commandArgs.join(" ").trim();
 
-		if (lower === "stop" || lower === "/stop") {
+		if (command === "stop" || command === "/stop") {
 			if (currentAbort) {
 				if (queuedTelegramTurns.length > 0) {
 					preserveQueuedTurnsAsHistory = true;
@@ -758,7 +760,73 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/new") {
+		if (command === "/model") {
+			if (!argument) {
+				const activeModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Current model: ${activeModel}. To switch, use /model <provider>/<model-id>.`);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot change model while pi is busy.");
+				return;
+			}
+			const separator = argument.indexOf("/");
+			if (separator <= 0 || separator === argument.length - 1) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Use /model <provider>/<model-id>.");
+				return;
+			}
+			const model = ctx.modelRegistry.find(argument.slice(0, separator), argument.slice(separator + 1));
+			if (!model) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Unknown model: ${argument}.`);
+				return;
+			}
+			try {
+				if (!(await pi.setModel(model))) {
+					await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `No configured credentials for ${argument}.`);
+					return;
+				}
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Model set to ${model.provider}/${model.id}.`);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Could not change model: ${message}`);
+			}
+			return;
+		}
+
+		if (command === "/context") {
+			const usage = ctx.getContextUsage();
+			if (!usage) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Context: unknown.");
+				return;
+			}
+			const contextWindow = usage.contextWindow ?? ctx.model?.contextWindow ?? 0;
+			const percent = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "?";
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Context: ${formatTokens(usage.tokens)}/${formatTokens(contextWindow)} (${percent}).`);
+			return;
+		}
+
+		if (command === "/think") {
+			const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+			const currentLevel = pi.getThinkingLevel();
+			if (!argument) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Thinking level: ${currentLevel}. Use /think <${thinkingLevels.join("|")}> to change it.`);
+				return;
+			}
+			const nextLevel = thinkingLevels.find((level) => level === argument.toLowerCase());
+			if (!nextLevel) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Unknown thinking level. Choose one of: ${thinkingLevels.join(", ")}.`);
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot change thinking level while pi is busy.");
+				return;
+			}
+			pi.setThinkingLevel(nextLevel);
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Thinking level set to ${nextLevel}.`);
+			return;
+		}
+
+		if (command === "/new") {
 			if (telegramSessionSwitchPending || !ctx.isIdle() || activeTelegramTurn || queuedTelegramTurns.length > 0) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot start a new session while pi is busy, switching sessions, or Telegram messages are queued.");
 				return;
@@ -790,7 +858,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/compact") {
+		if (command === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
@@ -808,7 +876,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/status") {
+		if (command === "/status") {
 			let totalInput = 0;
 			let totalOutput = 0;
 			let totalCacheRead = 0;
@@ -855,11 +923,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/help" || lower === "/start") {
+		if (command === "/help" || command === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, /new, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /new, /status, /context, /compact, /model, /think, /help, /stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -973,7 +1041,10 @@ export default function (pi: ExtensionAPI) {
 			commands: [
 				{ command: "new", description: "Start a fresh session" },
 				{ command: "status", description: "Show model and usage status" },
+				{ command: "context", description: "Show context window usage" },
 				{ command: "compact", description: "Compact the current session" },
+				{ command: "model", description: "Show or change the active model" },
+				{ command: "think", description: "Show or change thinking level" },
 				{ command: "help", description: "Show help and available commands" },
 				{ command: "stop", description: "Stop the current response" },
 			],

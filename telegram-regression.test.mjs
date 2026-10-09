@@ -20,11 +20,13 @@ async function setup() {
  if(method==='getUpdates'){ const batch=updates; updates=[]; await new Promise(resolve=>{const timer=setTimeout(resolve,3); init.signal?.addEventListener('abort',()=>{clearTimeout(timer);resolve()},{once:true});}); if(init.signal?.aborted) throw new DOMException('aborted','AbortError'); return Response.json({ok:true,result:batch}); }
  return Response.json({ok:true,result: method==='sendMessage'?{message_id:99}:true}); };
  const {default:extension}=await import('./index.ts?test='+Math.random());
- const handlers={}, commands={}, sent=[];
- const pi={on:(n,fn)=>handlers[n]=fn, registerCommand:(n,c)=>commands[n]=c, registerTool(){}, sendUserMessage:(content,opts)=>sent.push({content,opts})};
- let idle=true, currentSessionFile='/parent.json'; const ctx={isIdle:()=>idle, sessionManager:{getEntries:()=>[],getSessionFile:()=>currentSessionFile}, ui:{theme:{fg:(_c,s)=>s},setStatus(){}}, newSession:async()=>({cancelled:false})};
+ const handlers={}, commands={}, sent=[], effects={models:[],thinking:[]};
+ let idle=true, currentSessionFile='/parent.json', thinkingLevel='medium';
+ const models=[{provider:'test-provider',id:'model-a',contextWindow:4096},{provider:'test-provider',id:'model-b',contextWindow:8192}];
+ const ctx={isIdle:()=>idle, model:models[0], modelRegistry:{find:(provider,id)=>models.find(m=>m.provider===provider&&m.id===id),isUsingOAuth:()=>false}, getContextUsage:()=>({tokens:123,contextWindow:4096,percent:3}), sessionManager:{getEntries:()=>[],getSessionFile:()=>currentSessionFile}, ui:{theme:{fg:(_c,s)=>s},setStatus(){}}, newSession:async()=>({cancelled:false})};
+ const pi={on:(n,fn)=>handlers[n]=fn, registerCommand:(n,c)=>commands[n]=c, registerTool(){}, sendUserMessage:(content,opts)=>sent.push({content,opts}), setModel:async model=>{ctx.model=model;effects.models.push(`${model.provider}/${model.id}`);return true}, getThinkingLevel:()=>thinkingLevel, setThinkingLevel:level=>{thinkingLevel=level;effects.thinking.push(level)}};
  extension(pi); await handlers.session_start({},ctx); await new Promise(r=>setTimeout(r,20));
- return {home,calls,handlers,commands,ctx,sent,connect:()=>commands['telegram-connect'].handler('',ctx),setIdle(v){idle=v},setSessionFile(v){currentSessionFile=v},setUpdates(v){updates=v},cleanup:()=>rm(home,{recursive:true,force:true})};
+ return {home,calls,handlers,commands,ctx,sent,effects,connect:()=>commands['telegram-connect'].handler('',ctx),setIdle(v){idle=v},setSessionFile(v){currentSessionFile=v},setUpdates(v){updates=v},cleanup:()=>rm(home,{recursive:true,force:true})};
 }
 const message=(id,text)=>({message_id:id,chat:{id:7,type:'private'},from:{id:7,is_bot:false,first_name:'A'},text});
 
@@ -45,11 +47,38 @@ test('connecting registers Telegram command menu entries',async()=>{
   await h.connect();
   const registration=h.calls.find(x=>x.method==='setMyCommands');
   assert.ok(registration,'setMyCommands must be called when the bridge connects');
-  assert.deepEqual(registration.body.commands.map(command=>command.command),['new','status','compact','help','stop']);
+  assert.deepEqual(registration.body.commands.map(command=>command.command),['new','status','context','compact','model','think','help','stop']);
   assert.equal(registration.body.scope.type,'all_private_chats');
   const menuButton=h.calls.find(x=>x.method==='setChatMenuButton');
   assert.ok(menuButton,'the private-chat menu button must expose bot commands');
   assert.deepEqual(menuButton.body.menu_button,{type:'commands'});
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('Telegram /think updates Pi thinking level without forwarding it as a prompt',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(10,'/think high')}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
+  assert.deepEqual(h.effects.thinking,['high']); assert.equal(h.sent.length,0);
+  const reply=h.calls.find(x=>x.method==='sendMessage').body.text; assert.match(reply,/high/i);
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('Telegram /model selects a configured provider/model',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(11,'/model test-provider/model-b')}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
+  assert.deepEqual(h.effects.models,['test-provider/model-b']); assert.equal(h.sent.length,0);
+  assert.match(h.calls.find(x=>x.method==='sendMessage').body.text,/model-b/);
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('Telegram /context reports current token use and context window',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(12,'/context')}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
+  assert.match(h.calls.find(x=>x.method==='sendMessage').body.text,/123\/4\.1k \(3\.0%\)/);
+  assert.equal(h.sent.length,0);
  } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
 });
 
