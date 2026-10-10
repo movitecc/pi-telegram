@@ -73,18 +73,24 @@ test('Telegram /model selects a configured provider/model',async()=>{
  } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
 });
 
-test('Telegram /model opens an inline picker and tapping a model selects it',async()=>{
+test('Telegram /model opens a provider menu, then a model picker',async()=>{
  const h=await setup(); try {
   await h.connect(); h.setUpdates([{update_id:1,message:message(20,'/model')}]);
   await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
-  const picker=h.calls.find(x=>x.method==='sendMessage').body;
-  assert.ok(picker.reply_markup?.inline_keyboard,'/model should render selectable model buttons');
-  const buttons=picker.reply_markup.inline_keyboard.flat(); assert.equal(buttons.length,2);
-  h.setUpdates([{update_id:2,callback_query:{id:'cb-1',from:{id:7,is_bot:false,first_name:'A'},message:message(21,'Choose a model'),data:buttons[1].callback_data}}]);
+  const providerMenu=h.calls.find(x=>x.method==='sendMessage').body;
+  assert.match(providerMenu.text,/provider/i);
+  const providers=providerMenu.reply_markup.inline_keyboard.flat(); assert.equal(providers.length,1);
+  h.setUpdates([{update_id:2,callback_query:{id:'cb-provider',from:{id:7,is_bot:false,first_name:'A'},message:message(99,'Choose a provider'),data:providers[0].callback_data}}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='editMessageText'));
+  const modelMenu=h.calls.filter(x=>x.method==='editMessageText').at(-1).body;
+  assert.match(modelMenu.text,/test-provider/);
+  const models=modelMenu.reply_markup.inline_keyboard.flat().filter(button=>button.callback_data.startsWith('model:select:'));
+  assert.equal(models.length,2);
+  h.setUpdates([{update_id:3,callback_query:{id:'cb-model',from:{id:7,is_bot:false,first_name:'A'},message:message(99,'Choose a model'),data:models[1].callback_data}}]);
   await waitFor(()=>h.effects.models.length===1);
   assert.deepEqual(h.effects.models,['test-provider/model-b']);
-  assert.ok(h.calls.some(x=>x.method==='answerCallbackQuery'));
-  assert.ok(h.calls.some(x=>x.method==='editMessageText'));
+  assert.equal(h.calls.filter(x=>x.method==='answerCallbackQuery').length,2);
+  assert.equal(h.calls.filter(x=>x.method==='editMessageText').at(-1).body.reply_markup.inline_keyboard.length,0);
   const poll=h.calls.find(x=>x.method==='getUpdates'); assert.ok(poll.body.allowed_updates.includes('callback_query'));
  } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
 });

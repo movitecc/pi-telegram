@@ -753,7 +753,35 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	function buildModelPickerKeyboard(ctx: ExtensionContext, models: ReturnType<typeof getSelectableModels>, page: number) {
+	function getSelectableProviders(models: ReturnType<typeof getSelectableModels>): string[] {
+		return [...new Set(models.map((model) => model.provider))].sort((left, right) => left.localeCompare(right));
+	}
+
+	function buildProviderKeyboard(ctx: ExtensionContext, providers: string[], page: number) {
+		const pageSize = 8;
+		const start = page * pageSize;
+		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let index = start; index < Math.min(start + pageSize, providers.length); index += 2) {
+			const row = [index, index + 1]
+				.filter((providerIndex) => providerIndex < providers.length && providerIndex < start + pageSize)
+				.map((providerIndex) => {
+					const provider = providers[providerIndex]!;
+					const label = `${ctx.model?.provider === provider ? "✓ " : ""}${provider}`;
+					return { text: label.length > 64 ? `${label.slice(0, 63)}…` : label, callback_data: `model:provider:${providerIndex}` };
+				});
+			rows.push(row);
+		}
+		const pageCount = Math.ceil(providers.length / pageSize);
+		if (pageCount > 1) {
+			const navigation: Array<{ text: string; callback_data: string }> = [];
+			if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:providers:${page - 1}` });
+			if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:providers:${page + 1}` });
+			rows.push(navigation);
+		}
+		return { inline_keyboard: rows };
+	}
+
+	function buildModelKeyboard(ctx: ExtensionContext, providerIndex: number, models: ReturnType<typeof getSelectableModels>, page: number) {
 		const pageSize = 8;
 		const start = page * pageSize;
 		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
@@ -763,25 +791,26 @@ export default function (pi: ExtensionAPI) {
 				.map((modelIndex) => {
 					const model = models[modelIndex]!;
 					const isCurrent = ctx.model?.provider === model.provider && ctx.model.id === model.id;
-					const fullLabel = `${isCurrent ? "✓ " : ""}${model.provider}/${model.id}`;
-					return { text: fullLabel.length > 64 ? `${fullLabel.slice(0, 63)}…` : fullLabel, callback_data: `model:select:${modelIndex}` };
+					const fullLabel = `${isCurrent ? "✓ " : ""}${model.id}`;
+					return { text: fullLabel.length > 64 ? `${fullLabel.slice(0, 63)}…` : fullLabel, callback_data: `model:select:${providerIndex}:${modelIndex}` };
 				});
 			rows.push(row);
 		}
 		const pageCount = Math.ceil(models.length / pageSize);
-		if (pageCount > 1) {
-			const navigation: Array<{ text: string; callback_data: string }> = [];
-			if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:page:${page - 1}` });
-			if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:page:${page + 1}` });
-			rows.push(navigation);
-		}
+		const navigation: Array<{ text: string; callback_data: string }> = [
+			{ text: "‹ Providers", callback_data: `model:providers:${Math.floor(providerIndex / pageSize)}` },
+		];
+		if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:page:${providerIndex}:${page - 1}` });
+		if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:page:${providerIndex}:${page + 1}` });
+		rows.push(navigation);
 		return { inline_keyboard: rows };
 	}
 
-	async function renderModelPicker(chatId: number, ctx: ExtensionContext, page = 0, messageId?: number): Promise<void> {
+	async function renderProviderPicker(chatId: number, ctx: ExtensionContext, page = 0, messageId?: number): Promise<void> {
 		const models = getSelectableModels(ctx);
-		if (models.length === 0) {
-			const text = "No models with configured credentials are available.";
+		const providers = getSelectableProviders(models);
+		if (providers.length === 0) {
+			const text = "No providers with configured model credentials are available.";
 			if (messageId !== undefined) {
 				await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: [] } });
 			} else {
@@ -790,16 +819,40 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const pageSize = 8;
-		const pageCount = Math.ceil(models.length / pageSize);
+		const pageCount = Math.ceil(providers.length / pageSize);
 		const safePage = Math.max(0, Math.min(page, pageCount - 1));
-		const text = `Choose a model (${safePage + 1}/${pageCount}). Current: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown"}`;
-		const reply_markup = buildModelPickerKeyboard(ctx, models, safePage);
+		const currentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
+		const text = `Choose a provider (${safePage + 1}/${pageCount}). Current model: ${currentModel}`;
+		const reply_markup = buildProviderKeyboard(ctx, providers, safePage);
 		if (messageId !== undefined) {
 			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup });
 		} else {
 			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, reply_markup });
 		}
 	}
+
+	async function renderModelPicker(chatId: number, ctx: ExtensionContext, providerIndex: number, page = 0, messageId?: number): Promise<void> {
+		const models = getSelectableModels(ctx);
+		const provider = getSelectableProviders(models)[providerIndex];
+		if (!provider) {
+			if (messageId !== undefined) {
+				await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text: "This provider menu has expired. Send /model again.", reply_markup: { inline_keyboard: [] } });
+			}
+			return;
+		}
+		const providerModels = models.filter((model) => model.provider === provider);
+		const pageSize = 8;
+		const pageCount = Math.ceil(providerModels.length / pageSize);
+		const safePage = Math.max(0, Math.min(page, pageCount - 1));
+		const text = `Choose a model from ${provider} (${safePage + 1}/${pageCount}).`;
+		const reply_markup = buildModelKeyboard(ctx, providerIndex, providerModels, safePage);
+		if (messageId !== undefined) {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup });
+		} else {
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, reply_markup });
+		}
+	}
+
 
 	async function handleModelPickerCallback(query: TelegramCallbackQuery, ctx: ExtensionContext): Promise<void> {
 		const callbackQueryId = query.id;
@@ -808,23 +861,41 @@ export default function (pi: ExtensionAPI) {
 			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This bot is not authorized for your account.", show_alert: true });
 			return;
 		}
-		const match = /^model:(page|select):(\d+)$/.exec(query.data ?? "");
+		const match = /^model:(providers|provider|page|select):(\d+)(?::(\d+))?$/.exec(query.data ?? "");
 		if (!match) {
 			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired.", show_alert: true });
 			return;
 		}
 		const action = match[1];
 		const index = Number(match[2]);
-		if (action === "page") {
+		const subIndex = match[3] === undefined ? undefined : Number(match[3]);
+		if (action === "providers") {
 			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
-			await renderModelPicker(message.chat.id, ctx, index, message.message_id);
+			await renderProviderPicker(message.chat.id, ctx, index, message.message_id);
+			return;
+		}
+		if (action === "provider") {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderModelPicker(message.chat.id, ctx, index, 0, message.message_id);
+			return;
+		}
+		if (action === "page") {
+			if (subIndex === undefined) {
+				await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired.", show_alert: true });
+				return;
+			}
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderModelPicker(message.chat.id, ctx, index, subIndex, message.message_id);
 			return;
 		}
 		if (!ctx.isIdle()) {
 			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "Pi is busy; try again when it is idle.", show_alert: true });
 			return;
 		}
-		const model = getSelectableModels(ctx)[index];
+		const provider = getSelectableProviders(getSelectableModels(ctx))[index];
+		const model = provider === undefined || subIndex === undefined
+			? undefined
+			: getSelectableModels(ctx).filter((item) => item.provider === provider)[subIndex];
 		if (!model) {
 			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired. Send /model again.", show_alert: true });
 			return;
@@ -863,7 +934,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (command === "/model") {
 			if (!argument) {
-				await renderModelPicker(firstMessage.chat.id, ctx);
+				await renderProviderPicker(firstMessage.chat.id, ctx);
 				return;
 			}
 			if (!ctx.isIdle()) {
@@ -1147,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
 				{ command: "status", description: "Show model and usage status" },
 				{ command: "context", description: "Show context window usage" },
 				{ command: "compact", description: "Compact the current session" },
-				{ command: "model", description: "Show or change the active model" },
+				{ command: "model", description: "Pick a provider and model" },
 				{ command: "think", description: "Show or change thinking level" },
 				{ command: "help", description: "Show help and available commands" },
 				{ command: "stop", description: "Stop the current response" },
