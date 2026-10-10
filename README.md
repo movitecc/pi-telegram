@@ -127,7 +127,7 @@ Send `/new` to start a fresh Pi session while preserving the current session as 
 
 ### Common Pi controls
 
-- `/model` shows the current model; `/model <provider>/<model-id>` switches models when Pi is idle.
+- `/model` opens an inline picker of available models; choosing one switches models when Pi is idle. You can also use `/model <provider>/<model-id>` directly.
 - `/think` shows the current thinking level; `/think <off|minimal|low|medium|high|xhigh>` changes it when Pi is idle.
 - `/context` shows context-window usage.
 

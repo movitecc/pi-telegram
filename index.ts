@@ -103,10 +103,18 @@ interface TelegramMessage {
 	sticker?: TelegramSticker;
 }
 
+interface TelegramCallbackQuery {
+	id: string;
+	from: TelegramUser;
+	message?: TelegramMessage;
+	data?: string;
+}
+
 interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	edited_message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
 }
 
 interface TelegramGetFileResult {
@@ -738,6 +746,99 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	function getSelectableModels(ctx: ExtensionContext): ReturnType<ExtensionContext["modelRegistry"]["getAvailable"]> {
+		return [...ctx.modelRegistry.getAvailable()].sort((left, right) => {
+			const providerComparison = left.provider.localeCompare(right.provider);
+			return providerComparison || left.id.localeCompare(right.id);
+		});
+	}
+
+	function buildModelPickerKeyboard(ctx: ExtensionContext, models: ReturnType<typeof getSelectableModels>, page: number) {
+		const pageSize = 8;
+		const start = page * pageSize;
+		const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (let index = start; index < Math.min(start + pageSize, models.length); index += 2) {
+			const row = [index, index + 1]
+				.filter((modelIndex) => modelIndex < models.length && modelIndex < start + pageSize)
+				.map((modelIndex) => {
+					const model = models[modelIndex]!;
+					const isCurrent = ctx.model?.provider === model.provider && ctx.model.id === model.id;
+					const fullLabel = `${isCurrent ? "✓ " : ""}${model.provider}/${model.id}`;
+					return { text: fullLabel.length > 64 ? `${fullLabel.slice(0, 63)}…` : fullLabel, callback_data: `model:select:${modelIndex}` };
+				});
+			rows.push(row);
+		}
+		const pageCount = Math.ceil(models.length / pageSize);
+		if (pageCount > 1) {
+			const navigation: Array<{ text: string; callback_data: string }> = [];
+			if (page > 0) navigation.push({ text: "‹ Previous", callback_data: `model:page:${page - 1}` });
+			if (page + 1 < pageCount) navigation.push({ text: "Next ›", callback_data: `model:page:${page + 1}` });
+			rows.push(navigation);
+		}
+		return { inline_keyboard: rows };
+	}
+
+	async function renderModelPicker(chatId: number, ctx: ExtensionContext, page = 0, messageId?: number): Promise<void> {
+		const models = getSelectableModels(ctx);
+		if (models.length === 0) {
+			const text = "No models with configured credentials are available.";
+			if (messageId !== undefined) {
+				await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup: { inline_keyboard: [] } });
+			} else {
+				await sendTextReply(chatId, 0, text);
+			}
+			return;
+		}
+		const pageSize = 8;
+		const pageCount = Math.ceil(models.length / pageSize);
+		const safePage = Math.max(0, Math.min(page, pageCount - 1));
+		const text = `Choose a model (${safePage + 1}/${pageCount}). Current: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown"}`;
+		const reply_markup = buildModelPickerKeyboard(ctx, models, safePage);
+		if (messageId !== undefined) {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: messageId, text, reply_markup });
+		} else {
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, reply_markup });
+		}
+	}
+
+	async function handleModelPickerCallback(query: TelegramCallbackQuery, ctx: ExtensionContext): Promise<void> {
+		const callbackQueryId = query.id;
+		const message = query.message;
+		if (!message || message.chat.type !== "private" || query.from.is_bot || query.from.id !== config.allowedUserId) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This bot is not authorized for your account.", show_alert: true });
+			return;
+		}
+		const match = /^model:(page|select):(\d+)$/.exec(query.data ?? "");
+		if (!match) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired.", show_alert: true });
+			return;
+		}
+		const action = match[1];
+		const index = Number(match[2]);
+		if (action === "page") {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+			await renderModelPicker(message.chat.id, ctx, index, message.message_id);
+			return;
+		}
+		if (!ctx.isIdle()) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "Pi is busy; try again when it is idle.", show_alert: true });
+			return;
+		}
+		const model = getSelectableModels(ctx)[index];
+		if (!model) {
+			await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId, text: "This model menu has expired. Send /model again.", show_alert: true });
+			return;
+		}
+		await callTelegram("answerCallbackQuery", { callback_query_id: callbackQueryId });
+		let text: string;
+		try {
+			text = (await pi.setModel(model)) ? `Model set to ${model.provider}/${model.id}.` : `No configured credentials for ${model.provider}/${model.id}.`;
+		} catch (error) {
+			text = `Could not change model: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		await callTelegram("editMessageText", { chat_id: message.chat.id, message_id: message.message_id, text, reply_markup: { inline_keyboard: [] } });
+	}
+
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
@@ -762,8 +863,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (command === "/model") {
 			if (!argument) {
-				const activeModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Current model: ${activeModel}. To switch, use /model <provider>/<model-id>.`);
+				await renderModelPicker(firstMessage.chat.id, ctx);
 				return;
 			}
 			if (!ctx.isIdle()) {
@@ -968,6 +1068,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+		if (update.callback_query) {
+			await handleModelPickerCallback(update.callback_query, ctx);
+			return;
+		}
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
@@ -1016,7 +1120,7 @@ export default function (pi: ExtensionAPI) {
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
 						limit: 10,
 						timeout: 30,
-						allowed_updates: ["message", "edited_message"],
+						allowed_updates: ["message", "edited_message", "callback_query"],
 					},
 					{ signal },
 				);

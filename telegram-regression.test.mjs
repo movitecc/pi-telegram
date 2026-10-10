@@ -23,7 +23,7 @@ async function setup() {
  const handlers={}, commands={}, sent=[], effects={models:[],thinking:[]};
  let idle=true, currentSessionFile='/parent.json', thinkingLevel='medium';
  const models=[{provider:'test-provider',id:'model-a',contextWindow:4096},{provider:'test-provider',id:'model-b',contextWindow:8192}];
- const ctx={isIdle:()=>idle, model:models[0], modelRegistry:{find:(provider,id)=>models.find(m=>m.provider===provider&&m.id===id),isUsingOAuth:()=>false}, getContextUsage:()=>({tokens:123,contextWindow:4096,percent:3}), sessionManager:{getEntries:()=>[],getSessionFile:()=>currentSessionFile}, ui:{theme:{fg:(_c,s)=>s},setStatus(){}}, newSession:async()=>({cancelled:false})};
+ const ctx={isIdle:()=>idle, model:models[0], modelRegistry:{find:(provider,id)=>models.find(m=>m.provider===provider&&m.id===id),getAvailable:()=>models,isUsingOAuth:()=>false}, getContextUsage:()=>({tokens:123,contextWindow:4096,percent:3}), sessionManager:{getEntries:()=>[],getSessionFile:()=>currentSessionFile}, ui:{theme:{fg:(_c,s)=>s},setStatus(){}}, newSession:async()=>({cancelled:false})};
  const pi={on:(n,fn)=>handlers[n]=fn, registerCommand:(n,c)=>commands[n]=c, registerTool(){}, sendUserMessage:(content,opts)=>sent.push({content,opts}), setModel:async model=>{ctx.model=model;effects.models.push(`${model.provider}/${model.id}`);return true}, getThinkingLevel:()=>thinkingLevel, setThinkingLevel:level=>{thinkingLevel=level;effects.thinking.push(level)}};
  extension(pi); await handlers.session_start({},ctx); await new Promise(r=>setTimeout(r,20));
  return {home,calls,handlers,commands,ctx,sent,effects,connect:()=>commands['telegram-connect'].handler('',ctx),setIdle(v){idle=v},setSessionFile(v){currentSessionFile=v},setUpdates(v){updates=v},cleanup:()=>rm(home,{recursive:true,force:true})};
@@ -70,6 +70,34 @@ test('Telegram /model selects a configured provider/model',async()=>{
   await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
   assert.deepEqual(h.effects.models,['test-provider/model-b']); assert.equal(h.sent.length,0);
   assert.match(h.calls.find(x=>x.method==='sendMessage').body.text,/model-b/);
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('Telegram /model opens an inline picker and tapping a model selects it',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(20,'/model')}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
+  const picker=h.calls.find(x=>x.method==='sendMessage').body;
+  assert.ok(picker.reply_markup?.inline_keyboard,'/model should render selectable model buttons');
+  const buttons=picker.reply_markup.inline_keyboard.flat(); assert.equal(buttons.length,2);
+  h.setUpdates([{update_id:2,callback_query:{id:'cb-1',from:{id:7,is_bot:false,first_name:'A'},message:message(21,'Choose a model'),data:buttons[1].callback_data}}]);
+  await waitFor(()=>h.effects.models.length===1);
+  assert.deepEqual(h.effects.models,['test-provider/model-b']);
+  assert.ok(h.calls.some(x=>x.method==='answerCallbackQuery'));
+  assert.ok(h.calls.some(x=>x.method==='editMessageText'));
+  const poll=h.calls.find(x=>x.method==='getUpdates'); assert.ok(poll.body.allowed_updates.includes('callback_query'));
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
+test('Telegram model picker rejects callbacks from another user',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(30,'/model')}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='sendMessage'));
+  const button=h.calls.find(x=>x.method==='sendMessage').body.reply_markup.inline_keyboard[0][0];
+  h.setUpdates([{update_id:2,callback_query:{id:'cb-unauthorized',from:{id:8,is_bot:false,first_name:'B'},message:message(99,'Choose a model'),data:button.callback_data}}]);
+  await waitFor(()=>h.calls.some(x=>x.method==='answerCallbackQuery'&&x.body.callback_query_id==='cb-unauthorized'));
+  assert.deepEqual(h.effects.models,[]);
+  assert.equal(h.calls.find(x=>x.method==='answerCallbackQuery'&&x.body.callback_query_id==='cb-unauthorized').body.show_alert,true);
  } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
 });
 
