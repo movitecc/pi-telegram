@@ -116,6 +116,18 @@ test('Telegram /context reports current token use and context window',async()=>{
  } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
 });
 
+test('Telegram response cleanup does not publish a blank streaming draft',async()=>{
+ const h=await setup(); try {
+  await h.connect(); h.setUpdates([{update_id:1,message:message(40,'hello')}]);
+  await waitFor(()=>h.sent.length===1);
+  await h.handlers.agent_start({},h.ctx);
+  await h.handlers.message_update({message:{role:'assistant',content:[{type:'text',text:'reply'}]}},h.ctx);
+  await h.handlers.agent_end({messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:'reply'}]}]},h.ctx);
+  const emptyDrafts=h.calls.filter(x=>x.method==='sendMessageDraft'&&x.body.text==='');
+  assert.equal(emptyDrafts.length,0,'completion must not create an empty draft bubble in the Telegram chat');
+ } finally { await h.handlers.session_shutdown({},h.ctx); await h.cleanup(); }
+});
+
 test('two queued Telegram messages hand off using followUp exactly once',async()=>{
  const h=await setup(); try { await h.connect();
   h.setIdle(false);

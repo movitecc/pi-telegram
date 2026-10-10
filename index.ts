@@ -509,7 +509,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (state.mode === "draft") {
 			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-			await clearPreview(chatId);
+			// The final message replaces the active draft; an empty draft renders as a blank bubble.
+			previewState = undefined;
 			return true;
 		}
 		previewState = undefined;
